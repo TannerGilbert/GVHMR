@@ -1,16 +1,21 @@
 import argparse
-from pathlib import Path
-from tqdm import tqdm
-from hmr4d.utils.pylogger import Log
-import subprocess
 import os
+import subprocess
+from pathlib import Path
 
+from hmr4d.utils.pylogger import Log
+from tqdm import tqdm
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("-f", "--folder", type=str)
     parser.add_argument("-d", "--output_root", type=str, default=None)
     parser.add_argument("-s", "--static_cam", action="store_true", help="If true, skip DPVO")
+    parser.add_argument(
+        "--use_hands",
+        action="store_true",
+        help="If true, run demo_with_hands.py instead of demo.py. This will run HaMeR to get hand pose and fuse it into the SMPL-X output.",
+    )
     args = parser.parse_args()
 
     folder = Path(args.folder)
@@ -20,7 +25,10 @@ if __name__ == "__main__":
     mp4_paths = sorted(list(folder.glob("*.mp4")) + list(folder.glob("*.MP4")))
     Log.info(f"Found {len(mp4_paths)} .mp4 files in {folder}")
     for mp4_path in tqdm(mp4_paths):
-        command = ["python", "tools/demo/demo.py", "--video", str(mp4_path)]
+        if args.use_hands:
+            command = ["python", "tools/demo/demo_with_hands.py", "--video", str(mp4_path)]
+        else:
+            command = ["python", "tools/demo/demo.py", "--video", str(mp4_path)]
         if output_root is not None:
             command += ["--output_root", output_root]
         if args.static_cam:

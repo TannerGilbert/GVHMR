@@ -34,7 +34,8 @@ class DemoPL(pl.LightningModule):
             "cam_angvel": data["cam_angvel"][None],
             "f_imgseq": data["f_imgseq"][None],
         }
-        batch = {k: v.cuda() for k, v in batch.items()}
+        device = next(self.parameters()).device
+        batch = {k: v.to(device) for k, v in batch.items()}
         outputs = self.pipeline.forward(batch, train=False, postproc=True, static_cam=static_cam)
 
         pred = {

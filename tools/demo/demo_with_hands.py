@@ -8,14 +8,14 @@ import hydra
 import numpy as np
 import pytorch_lightning as pl
 import torch
-from einops import einsum, rearrange
+from einops import einsum
 from hmr4d.configs import register_store_gvhmr
 from hmr4d.model.gvhmr.gvhmr_pl_demo import DemoPL
 from hmr4d.utils.geo.hmr_cam import (convert_K_to_K4, create_camera_sensor,
                                      estimate_K, get_bbx_xys_from_xyxy)
 from hmr4d.utils.geo_transform import (apply_T_on_points, compute_cam_angvel,
                                        compute_T_ayfz2ay)
-from hmr4d.utils.net_utils import detach_to_cpu, to_cuda
+from hmr4d.utils.net_utils import detach_to_cpu
 from hmr4d.utils.preproc import Extractor, SimpleVO, Tracker, VitPoseExtractor
 from hmr4d.utils.pylogger import Log
 from hmr4d.utils.smplx_utils import make_smplx
@@ -34,6 +34,24 @@ from tqdm import tqdm
 CRF = 23  # 17 is lossless, every +6 halves the mp4 size
 
 
+def resolve_device(device_arg: str) -> torch.device:
+    if device_arg == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device_arg == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("Requested --device cuda but CUDA is not available.")
+    return torch.device(device_arg)
+
+
+def recursive_to_device(data, device: torch.device):
+    if isinstance(data, torch.Tensor):
+        return data.to(device)
+    if isinstance(data, dict):
+        return {k: recursive_to_device(v, device) for k, v in data.items()}
+    if isinstance(data, list):
+        return [recursive_to_device(v, device) for v in data]
+    return data
+
+
 def parse_args_to_cfg():
     # Put all args to cfg
     parser = argparse.ArgumentParser()
@@ -50,10 +68,10 @@ def parse_args_to_cfg():
         "If the camera zoom in a lot, you can try 135, 200 or even larger values.",
     )
     parser.add_argument("--verbose", action="store_true", help="If true, draw intermediate results")
+    parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
     parser.add_argument(
         "--use_hamer_hands",
-        action=argparse.BooleanOptionalAction,
-        default=True,
+        action="store_false",
         help="If true, run HaMeR and fuse hand pose into SMPL-X output.",
     )
     parser.add_argument(
@@ -170,7 +188,7 @@ def _load_vitpose_wholebody(device):
 
 
 @torch.no_grad()
-def run_hamer_preprocess(cfg, args):
+def run_hamer_preprocess(cfg, args, device: torch.device):
     if not args.use_hamer_hands:
         Log.info("[Preprocess] Skip HaMeR hand stage.")
         return
@@ -181,13 +199,11 @@ def run_hamer_preprocess(cfg, args):
         Log.info(f"[Preprocess] mano_params from {mano_params_path}")
         return
 
-    assert torch.cuda.is_available(), "HaMeR stage requires CUDA."
-
     ViTDetDataset, load_hamer, default_hamer_ckpt, recursive_to = _load_hamer_modules()
     hamer_ckpt = args.hamer_checkpoint if args.hamer_checkpoint is not None else default_hamer_ckpt
-    hamer_model, model_cfg_hamer = load_hamer(hamer_ckpt)
-    hamer_model = hamer_model.cuda().eval()
-    vitpose_wholebody = _load_vitpose_wholebody("cuda")
+    hamer_model, model_cfg_hamer = load_hamer(hamer_ckpt, map_location=str(device))
+    hamer_model = hamer_model.to(device).eval()
+    vitpose_wholebody = _load_vitpose_wholebody(str(device))
 
     bbx_xyxy = torch.load(paths.bbx)["bbx_xyxy"].cpu().numpy()
     reader = get_video_reader(cfg.video_path)
@@ -243,7 +259,7 @@ def run_hamer_preprocess(cfg, args):
                 num_workers=0,
             )
             for batch in dataloader:
-                batch = recursive_to(batch, "cuda")
+                batch = recursive_to(batch, str(device))
                 out = hamer_model(batch)
                 go_batch = out["pred_mano_params"]["global_orient"].detach().cpu()[:, 0]
                 hp_batch = out["pred_mano_params"]["hand_pose"].detach().cpu()
@@ -371,7 +387,7 @@ def merge_hamer_to_smplx(pred, mano_params):
 
 
 @torch.no_grad()
-def run_preprocess(cfg):
+def run_preprocess(cfg, device: torch.device):
     Log.info(f"[Preprocess] Start!")
     tic = Log.time()
     video_path = cfg.video_path
@@ -381,7 +397,7 @@ def run_preprocess(cfg):
 
     # Get bbx tracking result
     if not Path(paths.bbx).exists():
-        tracker = Tracker()
+        tracker = Tracker(device=device)
         bbx_xyxy = tracker.get_one_track(video_path).float()  # (L, 4)
         bbx_xys = get_bbx_xys_from_xyxy(bbx_xyxy, base_enlarge=1.2).float()  # (L, 3) apply aspect ratio and enlarge
         torch.save({"bbx_xyxy": bbx_xyxy, "bbx_xys": bbx_xys}, paths.bbx)
@@ -397,7 +413,7 @@ def run_preprocess(cfg):
 
     # Get VitPose
     if not Path(paths.vitpose).exists():
-        vitpose_extractor = VitPoseExtractor()
+        vitpose_extractor = VitPoseExtractor(device=device)
         vitpose = vitpose_extractor.extract(video_path, bbx_xys)
         torch.save(vitpose, paths.vitpose)
         del vitpose_extractor
@@ -411,7 +427,7 @@ def run_preprocess(cfg):
 
     # Get vit features
     if not Path(paths.vit_features).exists():
-        extractor = Extractor()
+        extractor = Extractor(device=device)
         vit_features = extractor.extract_video_features(video_path, bbx_xys)
         torch.save(vit_features, paths.vit_features)
         del extractor
@@ -475,7 +491,7 @@ def load_data_dict(cfg):
     return data
 
 
-def render_incam(cfg):
+def render_incam(cfg, device: torch.device):
     incam_video_path = Path(cfg.paths.incam_video)
     if incam_video_path.exists():
         Log.info(f"[Render Incam] Video already exists at {incam_video_path}")
@@ -483,12 +499,12 @@ def render_incam(cfg):
 
     pred = torch.load(cfg.paths.hmr4d_results)
     # Use full 45D hand axis-angle so fused HaMeR hand poses can be rendered directly.
-    smplx = make_smplx("supermotion", use_pca=False).cuda()
-    smplx2smpl = torch.load("hmr4d/utils/body_model/smplx2smpl_sparse.pt").cuda()
+    smplx = make_smplx("supermotion", use_pca=False).to(device)
+    smplx2smpl = torch.load("hmr4d/utils/body_model/smplx2smpl_sparse.pt", map_location=device).to(device)
     faces_smpl = make_smplx("smpl").faces
 
     # smpl
-    smplx_out = smplx(**to_cuda(pred["smpl_params_incam"]))
+    smplx_out = smplx(**recursive_to_device(pred["smpl_params_incam"], device))
     pred_c_verts = torch.stack([torch.matmul(smplx2smpl, v_) for v_ in smplx_out.vertices])
 
     # -- rendering code -- #
@@ -497,7 +513,7 @@ def render_incam(cfg):
     K = pred["K_fullimg"][0]
 
     # renderer
-    renderer = Renderer(width, height, device="cuda", faces=faces_smpl, K=K)
+    renderer = Renderer(width, height, device=str(device), faces=faces_smpl, K=K)
     reader = get_video_reader(video_path)  # (F, H, W, 3), uint8, numpy
     bbx_xys_render = torch.load(cfg.paths.bbx)["bbx_xys"]
 
@@ -505,7 +521,7 @@ def render_incam(cfg):
     verts_incam = pred_c_verts
     writer = get_writer(incam_video_path, fps=30, crf=CRF)
     for i, img_raw in tqdm(enumerate(reader), total=get_video_lwh(video_path)[0], desc=f"Rendering Incam"):
-        img = renderer.render_mesh(verts_incam[i].cuda(), img_raw, [0.8, 0.8, 0.8])
+        img = renderer.render_mesh(verts_incam[i].to(device), img_raw, [0.8, 0.8, 0.8])
 
         # # bbx
         # bbx_xys_ = bbx_xys_render[i].cpu().numpy()
@@ -518,7 +534,7 @@ def render_incam(cfg):
     reader.close()
 
 
-def render_global(cfg):
+def render_global(cfg, device: torch.device):
     global_video_path = Path(cfg.paths.global_video)
     if global_video_path.exists():
         Log.info(f"[Render Global] Video already exists at {global_video_path}")
@@ -527,13 +543,13 @@ def render_global(cfg):
     debug_cam = False
     pred = torch.load(cfg.paths.hmr4d_results)
     # Use full 45D hand axis-angle so fused HaMeR hand poses can be rendered directly.
-    smplx = make_smplx("supermotion", use_pca=False).cuda()
-    smplx2smpl = torch.load("hmr4d/utils/body_model/smplx2smpl_sparse.pt").cuda()
+    smplx = make_smplx("supermotion", use_pca=False).to(device)
+    smplx2smpl = torch.load("hmr4d/utils/body_model/smplx2smpl_sparse.pt", map_location=device).to(device)
     faces_smpl = make_smplx("smpl").faces
-    J_regressor = torch.load("hmr4d/utils/body_model/smpl_neutral_J_regressor.pt").cuda()
+    J_regressor = torch.load("hmr4d/utils/body_model/smpl_neutral_J_regressor.pt", map_location=device).to(device)
 
     # smpl
-    smplx_out = smplx(**to_cuda(pred["smpl_params_global"]))
+    smplx_out = smplx(**recursive_to_device(pred["smpl_params_global"], device))
     pred_ay_verts = torch.stack([torch.matmul(smplx2smpl, v_) for v_ in smplx_out.vertices])
 
     def move_to_start_point_face_z(verts):
@@ -563,13 +579,13 @@ def render_global(cfg):
     _, _, K = create_camera_sensor(width, height, 24)  # render as 24mm lens
 
     # renderer
-    renderer = Renderer(width, height, device="cuda", faces=faces_smpl, K=K)
+    renderer = Renderer(width, height, device=str(device), faces=faces_smpl, K=K)
     # renderer = Renderer(width, height, device="cuda", faces=faces_smpl, K=K, bin_size=0)
 
     # -- render mesh -- #
     scale, cx, cz = get_ground_params_from_points(joints_glob[:, 0], verts_glob)
     renderer.set_ground(scale * 1.5, cx, cz)
-    color = torch.ones(3).float().cuda() * 0.8
+    color = torch.ones(3, device=device).float() * 0.8
 
     render_length = length if not debug_cam else 8
     writer = get_writer(global_video_path, fps=30, crf=CRF)
@@ -582,13 +598,16 @@ def render_global(cfg):
 
 if __name__ == "__main__":
     cfg, args = parse_args_to_cfg()
+    device = resolve_device(args.device)
     paths = cfg.paths
-    Log.info(f"[GPU]: {torch.cuda.get_device_name()}")
-    Log.info(f'[GPU]: {torch.cuda.get_device_properties("cuda")}')
+    Log.info(f"[Device]: {device}")
+    if device.type == "cuda":
+        Log.info(f"[GPU]: {torch.cuda.get_device_name()}")
+        Log.info(f'[GPU]: {torch.cuda.get_device_properties("cuda")}')
 
     # ===== Preprocess and save to disk ===== #
-    run_preprocess(cfg)
-    run_hamer_preprocess(cfg, args)
+    run_preprocess(cfg, device)
+    run_hamer_preprocess(cfg, args, device)
     data = load_data_dict(cfg)
 
     # ===== HMR4D ===== #
@@ -596,7 +615,7 @@ if __name__ == "__main__":
         Log.info("[HMR4D] Predicting")
         model: DemoPL = hydra.utils.instantiate(cfg.model, _recursive_=False)
         model.load_pretrained_model(cfg.ckpt_path)
-        model = model.eval().cuda()
+        model = model.eval().to(device)
         tic = Log.sync_time()
         pred = model.predict(data, static_cam=cfg.static_cam)
         pred = detach_to_cpu(pred)
@@ -617,8 +636,8 @@ if __name__ == "__main__":
             torch.save(pred, paths.hmr4d_results)
 
     # ===== Render ===== #
-    render_incam(cfg)
-    render_global(cfg)
+    render_incam(cfg, device)
+    render_global(cfg, device)
     if not Path(paths.incam_global_horiz_video).exists():
         Log.info("[Merge Videos]")
         merge_videos_horizontal([paths.incam_video, paths.global_video], paths.incam_global_horiz_video)

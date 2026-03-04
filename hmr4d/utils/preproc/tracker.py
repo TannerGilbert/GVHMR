@@ -17,14 +17,19 @@ from hmr4d.utils.net_utils import moving_average_smooth
 
 
 class Tracker:
-    def __init__(self) -> None:
+    def __init__(self, device=None) -> None:
         # https://docs.ultralytics.com/modes/predict/
         self.yolo = YOLO(PROJ_ROOT / "inputs/checkpoints/yolo/yolov8x.pt")
+        if device is None:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        elif isinstance(device, str):
+            device = torch.device(device)
+        self.device = device
 
     def track(self, video_path):
         track_history = []
         cfg = {
-            "device": "cuda",
+            "device": str(self.device),
             "conf": 0.5,  # default 0.25, wham 0.5
             "classes": 0,  # human
             "verbose": False,
