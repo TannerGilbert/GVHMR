@@ -1,13 +1,13 @@
-import torch
-from hmr4d.network.hmr2 import load_hmr2, HMR2
-
-
-from hmr4d.utils.video_io_utils import read_video_np
 import cv2
 import numpy as np
-
-from hmr4d.network.hmr2.utils.preproc import crop_and_resize, crop_and_resize_torch, IMAGE_MEAN, IMAGE_STD
+import torch
 from tqdm import tqdm
+
+from hmr4d.network.hmr2 import HMR2, load_hmr2
+from hmr4d.network.hmr2.utils.preproc import (IMAGE_MEAN, IMAGE_STD,
+                                              crop_and_resize,
+                                              crop_and_resize_torch)
+from hmr4d.utils.video_io_utils import read_video_np
 
 
 def get_batch(input_path, bbx_xys, img_ds=0.5, img_dst_size=256, path_type="video"):
@@ -99,10 +99,11 @@ def get_batch_multiperson(input_path, bbx_xys, img_ds=0.5, img_dst_size=256, pat
 
 
 class Extractor:
-    def __init__(self, tqdm_leave=True, batch_size=16):
-        self.extractor: HMR2 = load_hmr2().cuda().eval()
+    def __init__(self, tqdm_leave=True, batch_size=16, device="cuda"):
+        self.extractor: HMR2 = load_hmr2().to(device).eval()
         self.tqdm_leave = tqdm_leave
         self.batch_size = batch_size
+        self.device = device
 
     def extract_video_features(self, video_path, bbx_xys, img_ds=0.5):
         """
@@ -120,7 +121,7 @@ class Extractor:
 
         # Inference
         F, _, H, W = imgs.shape  # (F, 3, H, W)
-        imgs = imgs.cuda()
+        imgs = imgs.to(self.device)
         batch_size = self.batch_size  # 5GB GPU memory, occupies all CUDA cores of 3090
         features = []
         for j in tqdm(range(0, F, batch_size), desc="HMR2 Feature", leave=self.tqdm_leave):
@@ -133,7 +134,11 @@ class Extractor:
         features = torch.cat(features, dim=0).clone()  # (F, 1024)
         return features
 
-    def extract_video_features_multiperson(self, video_path, bbx_xys, img_ds=0.5):  
-        person_num, F, _ = bbx_xys.shape
+    def extract_video_features_multiperson(self, video_path, bbx_xys, img_ds=0.5):
+        if bbx_xys.ndim == 3:  # multiple persons (person_num, F, 3)
+            person_num, F, _ = bbx_xys.shape
+        else:
+            F = bbx_xys.shape[0]
+            person_num = 1
         features = self.extract_video_features(video_path, bbx_xys, img_ds=img_ds)
         return features.reshape(person_num, F, 1024)  # (person_num, F, 1024)

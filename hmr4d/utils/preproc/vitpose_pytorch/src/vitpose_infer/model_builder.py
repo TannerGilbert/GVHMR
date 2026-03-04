@@ -1,19 +1,18 @@
-import torch
-
-# from configs.coco.ViTPose_base_coco_256x192 import model
-from .builder.heads.topdown_heatmap_simple_head import TopdownHeatmapSimpleHead
-
-# import TopdownHeatmapSimpleHead
-from .builder.backbones import ViT
+import copy
+import re
+from functools import partial
+from importlib import import_module
+from pathlib import Path
 
 # print(model)
 import torch
-import re
-import copy
-from functools import partial
 import torch.nn as nn
 import torch.nn.functional as F
-from importlib import import_module
+
+# import TopdownHeatmapSimpleHead
+from .builder.backbones import ViT
+# from configs.coco.ViTPose_base_coco_256x192 import model
+from .builder.heads.topdown_heatmap_simple_head import TopdownHeatmapSimpleHead
 
 models = {
     "ViTPose_huge_wholebody_256x192": dict(
@@ -194,7 +193,9 @@ def build_model(model_name, checkpoint=None):
 
     pose = VitPoseModel(backbone, head)
     if checkpoint is not None:
-        check = torch.load(checkpoint, weights_only=True)
+        ckpt_path = Path(checkpoint).expanduser()
+        ckpt_path = ckpt_path.resolve(strict=True)
+        check = torch.load(ckpt_path, weights_only=True)
         # part_features = 256
         # state_dict = check["state_dict"]
         # new_state_dict = copy.deepcopy(state_dict)

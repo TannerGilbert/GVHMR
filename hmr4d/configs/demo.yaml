@@ -28,7 +28,7 @@ video_path: "${output_dir}/0_input_video.mp4"
 # Options
 static_cam: False
 verbose: False
-use_dpvo: False
+use_dpvo: True
 f_mm: null  # focal length of fullframe camera in mm
 
 paths:
@@ -45,3 +45,4 @@ paths:
   global_video: ${output_dir}/2_global.mp4
   incam_global_horiz_video: ${output_dir}/${video_name}_3_incam_global_horiz.mp4
   slam: ${preprocess_dir}/slam_results.pt
+  cropped_imgs: ${output_dir}/cropped_imgs.pt

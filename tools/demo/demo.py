@@ -1,37 +1,33 @@
-import cv2
-import torch
-import pytorch_lightning as pl
-import numpy as np
 import argparse
-from hmr4d.utils.pylogger import Log
-import hydra
-from hydra import initialize_config_module, compose
 from pathlib import Path
+
+import cv2
+import hydra
+import numpy as np
+import pytorch_lightning as pl
+import torch
+from einops import einsum, rearrange
+from hydra import compose, initialize_config_module
 from pytorch3d.transforms import quaternion_to_matrix
+from tqdm import tqdm
 
 from hmr4d.configs import register_store_gvhmr
-from hmr4d.utils.video_io_utils import (
-    get_video_lwh,
-    read_video_np,
-    save_video,
-    merge_videos_horizontal,
-    get_writer,
-    get_video_reader,
-)
-from hmr4d.utils.vis.cv2_utils import draw_bbx_xyxy_on_image_batch, draw_coco17_skeleton_batch
-
-from hmr4d.utils.preproc import Tracker, Extractor, VitPoseExtractor, SimpleVO
-
-from hmr4d.utils.geo.hmr_cam import get_bbx_xys_from_xyxy, estimate_K, convert_K_to_K4, create_camera_sensor
-from hmr4d.utils.geo_transform import compute_cam_angvel
 from hmr4d.model.gvhmr.gvhmr_pl_demo import DemoPL
+from hmr4d.utils.geo.hmr_cam import (convert_K_to_K4, create_camera_sensor,
+                                     estimate_K, get_bbx_xys_from_xyxy)
+from hmr4d.utils.geo_transform import (apply_T_on_points, compute_cam_angvel,
+                                       compute_T_ayfz2ay)
 from hmr4d.utils.net_utils import detach_to_cpu, to_cuda
+from hmr4d.utils.preproc import Extractor, SimpleVO, Tracker, VitPoseExtractor
+from hmr4d.utils.pylogger import Log
 from hmr4d.utils.smplx_utils import make_smplx
-from hmr4d.utils.vis.renderer import Renderer, get_global_cameras_static, get_ground_params_from_points
-from tqdm import tqdm
-from hmr4d.utils.geo_transform import apply_T_on_points, compute_T_ayfz2ay
-from einops import einsum, rearrange
-
+from hmr4d.utils.video_io_utils import (get_video_lwh, get_video_reader,
+                                        get_writer, merge_videos_horizontal,
+                                        read_video_np, save_video)
+from hmr4d.utils.vis.cv2_utils import (draw_bbx_xyxy_on_image_batch,
+                                       draw_coco17_skeleton_batch)
+from hmr4d.utils.vis.renderer import (Renderer, get_global_cameras_static,
+                                      get_ground_params_from_points)
 
 CRF = 23  # 17 is lossless, every +6 halves the mp4 size
 
@@ -107,8 +103,8 @@ def run_preprocess(cfg):
     # Get bbx tracking result
     if not Path(paths.bbx).exists():
         tracker = Tracker()
-        bbx_xyxy = tracker.get_one_track(video_path).float()  # (L, 4)
-        bbx_xys = get_bbx_xys_from_xyxy(bbx_xyxy, base_enlarge=1.2).float()  # (L, 3) apply aspect ratio and enlarge
+        bbx_xyxy, _ = tracker.get_one_track(video_path)  # (L, 4)
+        bbx_xys = get_bbx_xys_from_xyxy(bbx_xyxy.float(), base_enlarge=1.2).float()  # (L, 3) apply aspect ratio and enlarge
         torch.save({"bbx_xyxy": bbx_xyxy, "bbx_xys": bbx_xys}, paths.bbx)
         del tracker
     else:
@@ -212,6 +208,9 @@ def render_incam(cfg):
     faces_smpl = make_smplx("smpl").faces
 
     # smpl
+    a = to_cuda(pred["smpl_params_incam"])
+    print("Shapes:", a['body_pose'].shape, a['betas'].shape, a['global_orient'].shape, a['transl'].shape)
+    
     smplx_out = smplx(**to_cuda(pred["smpl_params_incam"]))
     pred_c_verts = torch.stack([torch.matmul(smplx2smpl, v_) for v_ in smplx_out.vertices])
 
@@ -314,7 +313,8 @@ if __name__ == "__main__":
         model.load_pretrained_model(cfg.ckpt_path)
         model = model.eval().cuda()
         tic = Log.sync_time()
-        pred = model.predict_multiperson(data, static_cam=cfg.static_cam)
+        print(f"Data keys: {list(data.keys())}")
+        pred = model.predict(data, static_cam=cfg.static_cam)
         pred = detach_to_cpu(pred)
         data_time = data["length"] / 30
         Log.info(f"[HMR4D] Elapsed: {Log.sync_time() - tic:.2f}s for data-length={data_time:.1f}s")

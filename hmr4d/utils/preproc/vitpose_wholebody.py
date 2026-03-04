@@ -1,13 +1,14 @@
+import numpy as np
 import torch
 import torch.nn.functional as F
-import numpy as np
-from .vitpose_pytorch import build_model
-from .vitfeat_extractor import get_batch, get_batch_multiperson
 from tqdm import tqdm
 
-from hmr4d.utils.kpts.kp2d_utils import keypoints_from_heatmaps
-from hmr4d.utils.geo_transform import cvt_p2d_from_pm1_to_i
 from hmr4d.utils.geo.flip_utils import flip_heatmap_coco133
+from hmr4d.utils.geo_transform import cvt_p2d_from_pm1_to_i
+from hmr4d.utils.kpts.kp2d_utils import keypoints_from_heatmaps
+
+from .vitfeat_extractor import get_batch, get_batch_multiperson
+from .vitpose_pytorch import build_model
 
 
 class VitPoseWholebodyExtractor:
@@ -64,12 +65,15 @@ class VitPoseWholebodyExtractor:
     @torch.no_grad()
     def extract_multiperson(self, video_path, bbx_xys, img_ds=0.5):
         # Get the batch
+        print(f"bbx_xys shape: {bbx_xys.shape}")
         if isinstance(video_path, str):
             # multiple persons (person_num, F, 3)
-            assert bbx_xys.ndim == 3, "bbx_xys should be 3-ndim but got shape: {}".format(bbx_xys.shape)
-            person_num = bbx_xys.shape[0]
-            imgs, bbx_xys = get_batch_multiperson(video_path, bbx_xys, img_ds=img_ds)
-
+            if bbx_xys.ndim == 3:  # multiple persons (person_num, F, 3)
+                imgs, bbx_xys = get_batch_multiperson(video_path, bbx_xys, img_ds=img_ds)
+                person_num = bbx_xys.shape[0]
+            else:
+                imgs, bbx_xys = get_batch(video_path, bbx_xys, img_ds=img_ds)
+                person_num = 1
         else:
             assert isinstance(video_path, torch.Tensor)
             imgs = video_path
@@ -100,5 +104,6 @@ class VitPoseWholebodyExtractor:
             vitpose.append(kp2d)
 
         vitpose = torch.cat(vitpose, dim=0).clone().reshape(person_num, -1, 133, 3)  # (person_num, F, 133, 3)
+        print(f"person_num: {person_num}, ViTPose wholebody shape: {vitpose.shape}")
         return vitpose, imgs  
 

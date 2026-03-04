@@ -1,12 +1,11 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import math
+from functools import partial
 
 import torch
-from functools import partial
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
-
 from timm.models.layers import drop_path, to_2tuple, trunc_normal_
 
 # from ..builder import BACKBONES
@@ -279,7 +278,7 @@ class ViT(nn.Module):
 
     def forward_features(self, x):
         B, C, H, W = x.shape
-        x, (Hp, Wp) = self.patch_embed(x)
+        x, (Hp, Wp) = self.patch_embed(x.to("cuda"))
 
         if self.pos_embed is not None:
             # fit for multiple GPU training
