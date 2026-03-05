@@ -1,7 +1,10 @@
 import argparse
 import copy
+import gc
+import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import cv2
 import hydra
@@ -52,6 +55,18 @@ def recursive_to_device(data, device: torch.device):
     return data
 
 
+def cleanup_vram(stage: str, device: torch.device):
+    if device.type != "cuda":
+        return
+    gc.collect()
+    torch.cuda.empty_cache()
+    try:
+        torch.cuda.ipc_collect()
+    except Exception:
+        pass
+    Log.info(f"[VRAM] Cleanup after {stage}")
+
+
 def parse_args_to_cfg():
     # Put all args to cfg
     parser = argparse.ArgumentParser()
@@ -71,7 +86,8 @@ def parse_args_to_cfg():
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
     parser.add_argument(
         "--use_hamer_hands",
-        action="store_false",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help="If true, run HaMeR and fuse hand pose into SMPL-X output.",
     )
     parser.add_argument(
@@ -84,8 +100,15 @@ def parse_args_to_cfg():
     parser.add_argument(
         "--hamer_rescale_factor",
         type=float,
-        default=2.0,
+        default=3.0,
         help="BBox padding scale factor for HaMeR hand crops.",
+    )
+    parser.add_argument(
+        "--hamer_merge_mode",
+        type=str,
+        default="mano2smplx",
+        choices=["fingers_only", "mano2smplx"],
+        help="Hand-body fusion mode. 'mano2smplx' follows VincentHu19/Mano2Smpl-X.",
     )
     args = parser.parse_args()
 
@@ -136,6 +159,8 @@ def _load_hamer_modules():
         from hamer.models import DEFAULT_CHECKPOINT as DEFAULT_CHECKPOINT_HAMER
         from hamer.models import load_hamer
         from hamer.utils import recursive_to
+        from hamer.utils.renderer import Renderer as HamerRenderer
+        from hamer.utils.renderer import cam_crop_to_full
     except ModuleNotFoundError:
         repo_root = Path(__file__).resolve().parents[3]
         hamer_root = repo_root / "hand_reconstruction" / "hamer"
@@ -147,7 +172,9 @@ def _load_hamer_modules():
         from hamer.models import DEFAULT_CHECKPOINT as DEFAULT_CHECKPOINT_HAMER
         from hamer.models import load_hamer
         from hamer.utils import recursive_to
-    return ViTDetDataset, load_hamer, DEFAULT_CHECKPOINT_HAMER, recursive_to
+        from hamer.utils.renderer import Renderer as HamerRenderer
+        from hamer.utils.renderer import cam_crop_to_full
+    return ViTDetDataset, load_hamer, DEFAULT_CHECKPOINT_HAMER, recursive_to, cam_crop_to_full, HamerRenderer
 
 
 def _load_vitpose_wholebody(device):
@@ -195,11 +222,13 @@ def run_hamer_preprocess(cfg, args, device: torch.device):
 
     paths = cfg.paths
     mano_params_path = Path(paths.get("mano_params", Path(cfg.preprocess_dir) / "mano_params.pt"))
-    if mano_params_path.exists():
+    hamer_cache_path = Path(paths.get("hamer_render_cache", Path(cfg.preprocess_dir) / "hamer_render_cache.pt"))
+    if mano_params_path.exists() and hamer_cache_path.exists():
         Log.info(f"[Preprocess] mano_params from {mano_params_path}")
+        Log.info(f"[Preprocess] hamer_render_cache from {hamer_cache_path}")
         return
 
-    ViTDetDataset, load_hamer, default_hamer_ckpt, recursive_to = _load_hamer_modules()
+    ViTDetDataset, load_hamer, default_hamer_ckpt, recursive_to, cam_crop_to_full, _ = _load_hamer_modules()
     hamer_ckpt = args.hamer_checkpoint if args.hamer_checkpoint is not None else default_hamer_ckpt
     hamer_model, model_cfg_hamer = load_hamer(hamer_ckpt, map_location=str(device))
     hamer_model = hamer_model.to(device).eval()
@@ -212,16 +241,18 @@ def run_hamer_preprocess(cfg, args, device: torch.device):
     eye3 = torch.eye(3, dtype=torch.float32)
     left_go_list, left_hp_list, left_valid_list = [], [], []
     right_go_list, right_hp_list, right_valid_list = [], [], []
+    hamer_render_frames = []
 
     for i, frame in tqdm(enumerate(reader), total=length, desc="HaMeR"):
         frame_rgb = frame
         frame_bgr = frame_rgb[:, :, ::-1]
+        h, w = frame_rgb.shape[:2]
         x1, y1, x2, y2 = bbx_xyxy[i].astype(np.float32)
         det = np.array([[x1, y1, x2, y2, 1.0]], dtype=np.float32)
         vitposes_out = vitpose_wholebody(frame_rgb, det)
 
-        bboxes = []
-        sides = []
+        best_left = None  # (score, bbox)
+        best_right = None  # (score, bbox)
         for vitpose in vitposes_out:
             left_hand_keyp = vitpose["keypoints"][-42:-21]
             right_hand_keyp = vitpose["keypoints"][-21:]
@@ -229,13 +260,26 @@ def run_hamer_preprocess(cfg, args, device: torch.device):
             valid = left_hand_keyp[:, 2] > 0.5
             if int(valid.sum()) > 3:
                 keyp = left_hand_keyp[valid]
-                bboxes.append([keyp[:, 0].min(), keyp[:, 1].min(), keyp[:, 0].max(), keyp[:, 1].max()])
-                sides.append(0)
+                bbox = [keyp[:, 0].min(), keyp[:, 1].min(), keyp[:, 0].max(), keyp[:, 1].max()]
+                score = float(keyp[:, 2].mean())
+                if (best_left is None) or (score > best_left[0]):
+                    best_left = (score, bbox)
             valid = right_hand_keyp[:, 2] > 0.5
             if int(valid.sum()) > 3:
                 keyp = right_hand_keyp[valid]
-                bboxes.append([keyp[:, 0].min(), keyp[:, 1].min(), keyp[:, 0].max(), keyp[:, 1].max()])
-                sides.append(1)
+                bbox = [keyp[:, 0].min(), keyp[:, 1].min(), keyp[:, 0].max(), keyp[:, 1].max()]
+                score = float(keyp[:, 2].mean())
+                if (best_right is None) or (score > best_right[0]):
+                    best_right = (score, bbox)
+
+        bboxes = []
+        sides = []
+        if best_left is not None:
+            bboxes.append(best_left[1])
+            sides.append(0)
+        if best_right is not None:
+            bboxes.append(best_right[1])
+            sides.append(1)
 
         left_go = eye3.clone()
         left_hp = eye3.clone()[None].repeat(15, 1, 1)
@@ -243,6 +287,11 @@ def run_hamer_preprocess(cfg, args, device: torch.device):
         right_hp = eye3.clone()[None].repeat(15, 1, 1)
         left_valid = False
         right_valid = False
+        frame_verts = []
+        frame_cam_t = []
+        frame_is_right = []
+        frame_focal = float(model_cfg_hamer.EXTRA.FOCAL_LENGTH)
+        frame_render_res = [int(w), int(h)]
 
         if len(bboxes) > 0:
             dataset = ViTDetDataset(
@@ -261,9 +310,26 @@ def run_hamer_preprocess(cfg, args, device: torch.device):
             for batch in dataloader:
                 batch = recursive_to(batch, str(device))
                 out = hamer_model(batch)
+                pred_cam = out["pred_cam"]
+                pred_cam[:, 1] = (2 * batch["right"] - 1) * pred_cam[:, 1]
+                box_center = batch["box_center"].float()
+                box_size = batch["box_size"].float()
+                img_size = batch["img_size"].float()
+                scaled_focal_length = model_cfg_hamer.EXTRA.FOCAL_LENGTH / model_cfg_hamer.MODEL.IMAGE_SIZE * img_size.max()
+                frame_focal = float(scaled_focal_length.detach().cpu())
+                frame_render_res = [int(img_size[0, 0].item()), int(img_size[0, 1].item())]
+                pred_cam_t_full = cam_crop_to_full(
+                    pred_cam,
+                    box_center,
+                    box_size,
+                    img_size,
+                    scaled_focal_length,
+                ).detach().cpu().numpy()
+
                 go_batch = out["pred_mano_params"]["global_orient"].detach().cpu()[:, 0]
                 hp_batch = out["pred_mano_params"]["hand_pose"].detach().cpu()
                 side_batch = batch["right"].detach().cpu().numpy().astype(np.int32)
+                verts_batch = out["pred_vertices"].detach().cpu().numpy()
 
                 for n, side in enumerate(side_batch):
                     if side == 0 and not left_valid:
@@ -275,12 +341,28 @@ def run_hamer_preprocess(cfg, args, device: torch.device):
                         right_hp = hp_batch[n]
                         right_valid = True
 
+                    hand_side = float(side_batch[n])
+                    verts = verts_batch[n].copy()
+                    verts[:, 0] = (2 * hand_side - 1) * verts[:, 0]
+                    frame_verts.append(verts)
+                    frame_cam_t.append(pred_cam_t_full[n].copy())
+                    frame_is_right.append(hand_side)
+
         left_go_list.append(left_go)
         left_hp_list.append(left_hp)
         left_valid_list.append(left_valid)
         right_go_list.append(right_go)
         right_hp_list.append(right_hp)
         right_valid_list.append(right_valid)
+        hamer_render_frames.append(
+            {
+                "verts": frame_verts,
+                "cam_t": frame_cam_t,
+                "is_right": frame_is_right,
+                "focal_length": frame_focal,
+                "render_res": frame_render_res,
+            }
+        )
 
     reader.close()
 
@@ -292,8 +374,103 @@ def run_hamer_preprocess(cfg, args, device: torch.device):
         "right_hand_pose": torch.stack(right_hp_list, dim=0),
         "right_hand_valid": torch.tensor(right_valid_list, dtype=torch.bool),
     }
+    left_ratio = float(all_mano_params["left_hand_valid"].float().mean())
+    right_ratio = float(all_mano_params["right_hand_valid"].float().mean())
+    Log.info(f"[Preprocess] HaMeR valid ratio left={left_ratio:.2%}, right={right_ratio:.2%}")
     torch.save(all_mano_params, mano_params_path)
+    hamer_cache = {
+        "frames": hamer_render_frames,
+        "faces": np.asarray(hamer_model.mano.faces),
+        "default_focal_length": float(model_cfg_hamer.EXTRA.FOCAL_LENGTH),
+        "image_size": int(model_cfg_hamer.MODEL.IMAGE_SIZE),
+    }
+    torch.save(hamer_cache, hamer_cache_path)
     Log.info(f"[Preprocess] Saved mano_params to {mano_params_path}")
+    Log.info(f"[Preprocess] Saved hamer_render_cache to {hamer_cache_path}")
+
+
+def render_hamer_hands(cfg):
+    out_video = Path(cfg.paths.get("hamer_hands_video", Path(cfg.output_dir) / "0_hamer_hands.mp4"))
+    if out_video.exists():
+        Log.info(f"[Render HaMeR] Video already exists at {out_video}")
+        return
+
+    cache_path = Path(cfg.paths.get("hamer_render_cache", Path(cfg.preprocess_dir) / "hamer_render_cache.pt"))
+    if not cache_path.exists():
+        Log.info(f"[Render HaMeR] Missing cache at {cache_path}. Skip.")
+        return
+
+    _, _, _, _, _, HamerRenderer = _load_hamer_modules()
+    cache = torch.load(cache_path)
+    renderer_cfg = SimpleNamespace(
+        EXTRA=SimpleNamespace(FOCAL_LENGTH=cache["default_focal_length"]),
+        MODEL=SimpleNamespace(IMAGE_SIZE=cache["image_size"]),
+    )
+    renderer = HamerRenderer(renderer_cfg, faces=np.asarray(cache["faces"]))
+    frames = cache["frames"]
+
+    video_path = cfg.video_path
+    total = get_video_lwh(video_path)[0]
+    reader = get_video_reader(video_path)  # RGB
+    writer = get_writer(out_video, fps=30, crf=CRF)
+
+    for i, img_raw in tqdm(enumerate(reader), total=total, desc="Rendering HaMeR Hands"):
+        if i >= len(frames):
+            writer.write_frame(img_raw)
+            continue
+        frame_info = frames[i]
+        verts = frame_info["verts"]
+        if len(verts) == 0:
+            writer.write_frame(img_raw)
+            continue
+
+        cam_view = renderer.render_rgba_multiple(
+            verts,
+            cam_t=frame_info["cam_t"],
+            render_res=frame_info["render_res"],
+            is_right=frame_info["is_right"],
+            mesh_base_color=(0.65098039, 0.74117647, 0.85882353),
+            scene_bg_color=(1, 1, 1),
+            focal_length=frame_info["focal_length"],
+        )
+        input_img = img_raw.astype(np.float32) / 255.0
+        alpha = cam_view[:, :, 3:]
+        overlay = input_img[:, :, :3] * (1 - alpha) + cam_view[:, :, :3] * alpha
+        writer.write_frame((255.0 * overlay).clip(0, 255).astype(np.uint8))
+
+    writer.close()
+    reader.close()
+
+
+def render_hamer_hands_subprocess(cfg, args):
+    out_video = Path(cfg.paths.get("hamer_hands_video", Path(cfg.output_dir) / "0_hamer_hands.mp4"))
+    if out_video.exists():
+        Log.info(f"[Render HaMeR] Video already exists at {out_video}")
+        return
+
+    repo_root = Path(__file__).resolve().parents[3]
+    script_path = repo_root / "hand_reconstruction" / "hamer" / "video_demo.py"
+    assert script_path.exists(), f"Cannot find HaMeR video demo at {script_path}"
+
+    cmd = [
+        sys.executable,
+        str(script_path),
+        "--video_path",
+        str(cfg.video_path),
+        "--out_folder",
+        str(cfg.output_dir),
+        "--out_video_name",
+        out_video.name,
+        "--batch_size",
+        str(args.hamer_batch_size),
+        "--rescale_factor",
+        str(args.hamer_rescale_factor),
+    ]
+    if args.hamer_checkpoint is not None:
+        cmd.extend(["--checkpoint", str(args.hamer_checkpoint)])
+
+    Log.info(f"[Render HaMeR] Fallback via subprocess: {' '.join(cmd)}")
+    subprocess.run(cmd, check=True, cwd=str(repo_root))
 
 
 def _compute_global_rotmats(global_orient_mat, body_pose_mat):
@@ -306,13 +483,14 @@ def _compute_global_rotmats(global_orient_mat, body_pose_mat):
     return torch.stack(global_mats, dim=1)
 
 
-def merge_hamer_to_smplx(pred, mano_params):
+def merge_hamer_to_smplx(pred, mano_params, merge_mode="fingers_only"):
     pred_out = copy.deepcopy(pred)
     smpl_incam = pred_out["smpl_params_incam"]
     smpl_global = pred_out["smpl_params_global"]
 
-    # Left-hand convention conversion from HaMeR/MANO to SMPL-X.
-    M = torch.diag(torch.tensor([-1.0, 1.0, 1.0], dtype=torch.float32))
+    # Undo horizontal flip for left-hand MANO params (see HaMeR fliplr_params: y/z sign flip).
+    # In rotmat form this is conjugation by diag([1, -1, -1]).
+    M = torch.diag(torch.tensor([1.0, -1.0, -1.0], dtype=torch.float32))
 
     def _merge_one(smpl_params):
         body_pose = smpl_params["body_pose"].clone()  # (L, 63)
@@ -351,19 +529,19 @@ def merge_hamer_to_smplx(pred, mano_params):
         left_go = M_local[None] @ left_go @ M_local[None]
         left_hp = M_local[None, None] @ left_hp @ M_local[None, None]
 
-        # HaMeR global_orient is wrist global orientation in camera coordinates.
-        left_wrist_global = left_go
-        right_wrist_global = right_go
-        left_wrist_local = torch.linalg.inv(left_elbow_global) @ left_wrist_global
-        right_wrist_local = torch.linalg.inv(right_elbow_global) @ right_wrist_global
-
-        left_wrist_aa = matrix_to_axis_angle(left_wrist_local)
-        right_wrist_aa = matrix_to_axis_angle(right_wrist_local)
+        if merge_mode == "mano2smplx":
+            # Follow Mano2Smpl-X: replace wrist local poses using HaMeR wrist global.
+            left_wrist_global = left_go
+            right_wrist_global = right_go
+            left_wrist_local = torch.linalg.inv(left_elbow_global) @ left_wrist_global
+            right_wrist_local = torch.linalg.inv(right_elbow_global) @ right_wrist_global
+            left_wrist_aa = matrix_to_axis_angle(left_wrist_local)
+            right_wrist_aa = matrix_to_axis_angle(right_wrist_local)
+            body_pose[left_valid, 57:60] = left_wrist_aa[left_valid]
+            body_pose[right_valid, 60:63] = right_wrist_aa[right_valid]
         left_hand_aa = matrix_to_axis_angle(left_hp.reshape(-1, 3, 3)).reshape(-1, 45)
         right_hand_aa = matrix_to_axis_angle(right_hp.reshape(-1, 3, 3)).reshape(-1, 45)
 
-        body_pose[left_valid, 57:60] = left_wrist_aa[left_valid]
-        body_pose[right_valid, 60:63] = right_wrist_aa[right_valid]
         left_hand_pose[left_valid] = left_hand_aa[left_valid]
         right_hand_pose[right_valid] = right_hand_aa[right_valid]
 
@@ -383,6 +561,7 @@ def merge_hamer_to_smplx(pred, mano_params):
         smpl_global["right_hand_pose"] = fused_incam["right_hand_pose"].clone()
     pred_out["smpl_params_global"] = smpl_global
     pred_out["hamer_fused"] = True
+    pred_out["hamer_merge_mode"] = merge_mode
     return pred_out
 
 
@@ -499,7 +678,7 @@ def render_incam(cfg, device: torch.device):
 
     pred = torch.load(cfg.paths.hmr4d_results)
     # Use full 45D hand axis-angle so fused HaMeR hand poses can be rendered directly.
-    smplx = make_smplx("supermotion", use_pca=False).to(device)
+    smplx = make_smplx("supermotion", use_pca=False, flat_hand_mean=True).to(device)
     smplx2smpl = torch.load("hmr4d/utils/body_model/smplx2smpl_sparse.pt", map_location=device).to(device)
     faces_smpl = make_smplx("smpl").faces
 
@@ -543,7 +722,7 @@ def render_global(cfg, device: torch.device):
     debug_cam = False
     pred = torch.load(cfg.paths.hmr4d_results)
     # Use full 45D hand axis-angle so fused HaMeR hand poses can be rendered directly.
-    smplx = make_smplx("supermotion", use_pca=False).to(device)
+    smplx = make_smplx("supermotion", use_pca=False, flat_hand_mean=True).to(device)
     smplx2smpl = torch.load("hmr4d/utils/body_model/smplx2smpl_sparse.pt", map_location=device).to(device)
     faces_smpl = make_smplx("smpl").faces
     J_regressor = torch.load("hmr4d/utils/body_model/smpl_neutral_J_regressor.pt", map_location=device).to(device)
@@ -608,6 +787,7 @@ if __name__ == "__main__":
     # ===== Preprocess and save to disk ===== #
     run_preprocess(cfg, device)
     run_hamer_preprocess(cfg, args, device)
+    cleanup_vram("preprocess", device)
     data = load_data_dict(cfg)
 
     # ===== HMR4D ===== #
@@ -619,25 +799,36 @@ if __name__ == "__main__":
         tic = Log.sync_time()
         pred = model.predict(data, static_cam=cfg.static_cam)
         pred = detach_to_cpu(pred)
+        del model
         if args.use_hamer_hands:
             mano_params_path = Path(paths.get("mano_params", Path(cfg.preprocess_dir) / "mano_params.pt"))
             mano_params = torch.load(mano_params_path)
-            pred = merge_hamer_to_smplx(pred, mano_params)
+            pred = merge_hamer_to_smplx(pred, mano_params, merge_mode=args.hamer_merge_mode)
         data_time = data["length"] / 30
         Log.info(f"[HMR4D] Elapsed: {Log.sync_time() - tic:.2f}s for data-length={data_time:.1f}s")
         torch.save(pred, paths.hmr4d_results)
+        cleanup_vram("hmr4d inference", device)
     elif args.use_hamer_hands:
         pred = torch.load(paths.hmr4d_results)
-        if not bool(pred.get("hamer_fused", False)):
+        needs_refuse = (not bool(pred.get("hamer_fused", False))) or (pred.get("hamer_merge_mode") != args.hamer_merge_mode)
+        if needs_refuse:
             Log.info("[HMR4D] Existing results found without hand fusion. Applying cached HaMeR merge.")
             mano_params_path = Path(paths.get("mano_params", Path(cfg.preprocess_dir) / "mano_params.pt"))
             mano_params = torch.load(mano_params_path)
-            pred = merge_hamer_to_smplx(pred, mano_params)
+            pred = merge_hamer_to_smplx(pred, mano_params, merge_mode=args.hamer_merge_mode)
             torch.save(pred, paths.hmr4d_results)
 
     # ===== Render ===== #
+    try:
+        render_hamer_hands(cfg)
+    except Exception as e:
+        Log.warn(f"[Render HaMeR] In-process render failed: {type(e).__name__}: {e}")
+        render_hamer_hands_subprocess(cfg, args)
+    cleanup_vram("hamer visualization", device)
     render_incam(cfg, device)
+    cleanup_vram("incam render", device)
     render_global(cfg, device)
+    cleanup_vram("global render", device)
     if not Path(paths.incam_global_horiz_video).exists():
         Log.info("[Merge Videos]")
-        merge_videos_horizontal([paths.incam_video, paths.global_video], paths.incam_global_horiz_video)
+        merge_videos_horizontal([cfg.video_path, paths.incam_video], paths.incam_global_horiz_video)

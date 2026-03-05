@@ -1,37 +1,32 @@
-import cv2
-import torch
-import pytorch_lightning as pl
-import numpy as np
 import argparse
-from hmr4d.utils.pylogger import Log
-import hydra
-from hydra import initialize_config_module, compose
 from pathlib import Path
-from pytorch3d.transforms import quaternion_to_matrix
 
-from hmr4d.configs import register_store_gvhmr
-from hmr4d.utils.video_io_utils import (
-    get_video_lwh,
-    read_video_np,
-    save_video,
-    merge_videos_horizontal,
-    get_writer,
-    get_video_reader,
-)
-from hmr4d.utils.vis.cv2_utils import draw_bbx_xyxy_on_image_batch, draw_coco17_skeleton_batch
-
-from hmr4d.utils.preproc import Tracker, Extractor, VitPoseExtractor, SimpleVO
-
-from hmr4d.utils.geo.hmr_cam import get_bbx_xys_from_xyxy, estimate_K, convert_K_to_K4, create_camera_sensor
-from hmr4d.utils.geo_transform import compute_cam_angvel
-from hmr4d.model.gvhmr.gvhmr_pl_demo import DemoPL
-from hmr4d.utils.net_utils import detach_to_cpu
-from hmr4d.utils.smplx_utils import make_smplx
-from hmr4d.utils.vis.renderer import Renderer, get_global_cameras_static, get_ground_params_from_points
-from tqdm import tqdm
-from hmr4d.utils.geo_transform import apply_T_on_points, compute_T_ayfz2ay
+import cv2
+import hydra
+import numpy as np
+import pytorch_lightning as pl
+import torch
 from einops import einsum, rearrange
-
+from hmr4d.configs import register_store_gvhmr
+from hmr4d.model.gvhmr.gvhmr_pl_demo import DemoPL
+from hmr4d.utils.geo.hmr_cam import (convert_K_to_K4, create_camera_sensor,
+                                     estimate_K, get_bbx_xys_from_xyxy)
+from hmr4d.utils.geo_transform import (apply_T_on_points, compute_cam_angvel,
+                                       compute_T_ayfz2ay)
+from hmr4d.utils.net_utils import detach_to_cpu
+from hmr4d.utils.preproc import Extractor, SimpleVO, Tracker, VitPoseExtractor
+from hmr4d.utils.pylogger import Log
+from hmr4d.utils.smplx_utils import make_smplx
+from hmr4d.utils.video_io_utils import (get_video_lwh, get_video_reader,
+                                        get_writer, merge_videos_horizontal,
+                                        read_video_np, save_video)
+from hmr4d.utils.vis.cv2_utils import (draw_bbx_xyxy_on_image_batch,
+                                       draw_coco17_skeleton_batch)
+from hmr4d.utils.vis.renderer import (Renderer, get_global_cameras_static,
+                                      get_ground_params_from_points)
+from hydra import compose, initialize_config_module
+from pytorch3d.transforms import quaternion_to_matrix
+from tqdm import tqdm
 
 CRF = 23  # 17 is lossless, every +6 halves the mp4 size
 
@@ -354,4 +349,4 @@ if __name__ == "__main__":
     render_global(cfg, device)
     if not Path(paths.incam_global_horiz_video).exists():
         Log.info("[Merge Videos]")
-        merge_videos_horizontal([paths.incam_video, paths.global_video], paths.incam_global_horiz_video)
+        merge_videos_horizontal([cfg.video_path, paths.incam_video], paths.incam_global_horiz_video)
